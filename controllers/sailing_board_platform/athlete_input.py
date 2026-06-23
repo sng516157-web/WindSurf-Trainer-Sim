@@ -60,7 +60,8 @@ class AthleteKeyboardInput:
             "Athlete keyboard (focus 3D view):\n"
             "  CoG shift   A/D = sway    W/S = surge    Q/E = heave\n"
             "  Moment      Left/Right = roll    Up/Down = pitch    Z/X = yaw\n"
-            "  P           Toggle waves on/off (buoyancy stays active)"
+            "  P           Toggle waves on/off (buoyancy stays active)\n"
+            "  L           Toggle sail load on/off"
         )
 
     def poll_keys(self):

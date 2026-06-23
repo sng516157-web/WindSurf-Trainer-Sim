@@ -16,7 +16,7 @@
 Webots controller for the Stewart platform sailing-board simulator.
 
 Sea motion (SEA_STATE) drives waves on top of buoyancy. Athlete input (keyboard
-or F/T sensor) perturbs the deck via admittance control.
+or F/T sensor) and optional sail load perturb the deck via admittance control.
 
 Deck pose is measured with GPS (deck_gps) and InertialUnit (deck_inertial_unit).
 Both are zeroed to the neutral deck pose at startup.
@@ -32,11 +32,13 @@ from athlete_input import AthleteKeyboardInput
 from buoyancy import BuoyancyDynamics
 from force_plotter import try_create_plotter
 from hardware_config import load_preset
+from sail_force import MinimalSail, combine_pose_deltas
 from session_logger import SessionLogger
 
 # --- Runtime configuration ---------------------------------------------------
 PLATFORM_PRESET = "sim_full"  # "sim_full" | "desktop_hardware"
 ATHLETE_INPUT_MODE = "keyboard"  # "keyboard" | "ft_sensor"
+ENABLE_SAIL = True
 
 PLOT_HISTORY_SECONDS = 30.0
 ENABLE_LIVE_PLOTS = True
@@ -68,6 +70,32 @@ PLATFORM_NEUTRAL_TRANSLATION = CFG["platform_neutral_translation"]
 PLATFORM_NEUTRAL_ROTATION = CFG["platform_neutral_rotation"]
 PLATFORM_LOCAL_ANCHORS = CFG["platform_local_anchors"]
 SEA_STATE = CFG["sea_state"]
+SAIL_AREA = CFG["sail_area"]
+SAIL_CE_SURGE_OFFSET = CFG["sail_ce_surge_offset"]
+SAIL_FORCE_SCALE = CFG["sail_force_scale"]
+SAIL_TORQUE_SCALE = CFG["sail_torque_scale"]
+SAIL_ADMITTANCE_FACTOR = CFG["sail_admittance_factor"]
+SAIL_MAX_SIDE_FORCE = CFG["sail_max_side_force"]
+SAIL_MAX_ROLL_TORQUE = CFG["sail_max_roll_torque"]
+SAIL_POSE_DELTA_LIMITS = (0.008, 0.012, 0.006, 0.04, 0.04, 0.025)
+MAX_COMMAND_ROLL_PITCH = math.radians(32.0)
+
+
+def clamp_command_pose(pose):
+    surge, sway, heave, roll, pitch, yaw = pose
+    limit = MAX_COMMAND_ROLL_PITCH
+    return (
+        surge,
+        sway,
+        heave,
+        clamp(roll, -limit, limit),
+        clamp(pitch, -limit, limit),
+        yaw,
+    )
+
+
+def scale_admittance_gains(gains, factor):
+    return tuple(gain * factor for gain in gains)
 
 
 def axis_angle_to_matrix(axis, angle):
@@ -118,6 +146,16 @@ def cross(left, right):
 
 def athlete_lever_arm(cog_offset, neutral_cog_z):
     return [cog_offset[0], cog_offset[1], neutral_cog_z + cog_offset[2]]
+
+
+def build_plot_wrench(athlete_force, athlete_torque, sail_force, sail_torque):
+    command_force = [
+        athlete_force[index] + sail_force[index] for index in range(3)
+    ]
+    command_torque = [
+        athlete_torque[index] + sail_torque[index] for index in range(3)
+    ]
+    return command_force, command_torque
 
 
 def wave_sum(components, time):
@@ -176,13 +214,18 @@ def update_hud(
     command_pose,
     athlete_pose,
     measured_pose=None,
+    sail=None,
 ):
     if not supervisor.supervisor:
         return
     wave_state = "WAVES ON" if waves_enabled else "WAVES OFF"
+    sail_state = "sail on" if sail is not None and sail.enabled else "sail off"
     lines = [
-        f"{wave_state}  |  buoyancy on  |  {athlete_input_label(athlete)}",
+        f"{wave_state}  |  buoyancy on  |  {sail_state}  |  {athlete_input_label(athlete)}",
     ]
+
+    if sail is not None:
+        lines.append(sail.status_line())
 
     if ATHLETE_INPUT_MODE == "keyboard":
         lines.append(
@@ -349,8 +392,26 @@ def main():
     kinematics = StewartInverseKinematics()
     sea = SeaWaveMotion(SEA_STATE)
     admittance = AdmittanceControl(TRANSLATION_ADMITTANCE, ROTATION_ADMITTANCE)
+    sail_admittance = AdmittanceControl(
+        scale_admittance_gains(TRANSLATION_ADMITTANCE, SAIL_ADMITTANCE_FACTOR),
+        scale_admittance_gains(ROTATION_ADMITTANCE, SAIL_ADMITTANCE_FACTOR),
+        pose_delta_limits=SAIL_POSE_DELTA_LIMITS,
+    )
     buoyancy = BuoyancyDynamics(TRACK_STIFFNESS, BUOYANCY_STIFFNESS, HYDRO_DAMPING)
     athlete = create_athlete_input(robot, athlete_ft_sensor)
+    sail = (
+        MinimalSail(
+            sail_area=SAIL_AREA,
+            ce_surge=SAIL_CE_SURGE_OFFSET,
+            ce_height=NEUTRAL_COG_Z + SAIL_CE_SURGE_OFFSET,
+            force_scale=SAIL_FORCE_SCALE,
+            torque_scale=SAIL_TORQUE_SCALE,
+            max_side_force=SAIL_MAX_SIDE_FORCE,
+            max_roll_torque=SAIL_MAX_ROLL_TORQUE,
+        )
+        if ENABLE_SAIL
+        else None
+    )
     plotter = try_create_plotter(
         history_seconds=PLOT_HISTORY_SECONDS,
         enabled=ENABLE_LIVE_PLOTS,
@@ -369,6 +430,8 @@ def main():
         print(f"CSV logging: {session_logger.path}")
 
     athlete.print_controls()
+    if sail is not None:
+        MinimalSail.print_controls()
     if not ENABLE_LIVE_PLOTS:
         print("Performance tip: live plots are off (matplotlib slows Webots).")
 
@@ -380,11 +443,16 @@ def main():
     next_plot_time = sensor_ready_time
     next_log_time = sensor_ready_time
     previous_keys = set()
+    measured_pose = None
+    command_pose = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    deck_rpy_for_sail = (0.0, 0.0, 0.0)
     try:
         while robot.step(time_step) != -1:
             newly_pressed = set()
+            active_keys = set()
             if ATHLETE_INPUT_MODE == "keyboard":
                 newly_pressed = athlete.update(dt)
+                active_keys = athlete._active_keys
             else:
                 athlete.update(dt)
                 keys_now = set()
@@ -395,18 +463,38 @@ def main():
                     keys_now.add(key & Keyboard.KEY)
                 newly_pressed = keys_now - previous_keys
                 previous_keys = keys_now
+                active_keys = keys_now
+
+            if sail is not None:
+                sail.update(dt, active_keys)
 
             if ord("p") in newly_pressed or ord("P") in newly_pressed:
                 waves_enabled = not waves_enabled
                 print(f"Waves {'enabled' if waves_enabled else 'disabled'} (buoyancy still active).")
 
+            if sail is not None and ord("L") in newly_pressed:
+                sail.enabled = not sail.enabled
+                print(f"Sail {'enabled' if sail.enabled else 'disabled'}.")
+
             if ATHLETE_INPUT_MODE == "keyboard":
                 athlete.update_visual(robot)
 
             athlete_force, athlete_torque = athlete.wrench()
-            wave_pose = sea.pose_at(simulation_time) if waves_enabled else (0.0,) * 6
             athlete_pose = admittance.pose_delta(athlete_force, athlete_torque)
-            command_pose = buoyancy.step(dt, wave_pose, athlete_pose)
+            if sail is not None and sail.enabled:
+                sail_force, sail_torque = sail.wrench(
+                    simulation_time, deck_rpy_for_sail, dt
+                )
+                sail_pose = sail_admittance.pose_delta(sail_force, sail_torque)
+                input_pose = combine_pose_deltas(athlete_pose, sail_pose)
+            else:
+                sail_force, sail_torque = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+                input_pose = athlete_pose
+
+            wave_pose = sea.pose_at(simulation_time) if waves_enabled else (0.0,) * 6
+            command_pose = clamp_command_pose(
+                buoyancy.step(dt, wave_pose, input_pose)
+            )
             piston_positions = kinematics.compute(*command_pose)
             for index, position in enumerate(piston_positions):
                 pistons[index].setPosition(position)
@@ -420,18 +508,36 @@ def main():
                 orientation_delta = read_orientation_delta(deck_imu, imu_neutral_rpy)
                 measured_pose = position_delta + orientation_delta
 
+            if measured_pose is not None:
+                deck_rpy_for_sail = measured_pose[3:6]
+            else:
+                deck_rpy_for_sail = command_pose[3:6]
+
             update_hud(
                 robot,
                 waves_enabled,
                 athlete,
                 command_pose,
-                athlete_pose,
+                input_pose,
                 measured_pose,
+                sail=sail,
             )
 
             if simulation_time >= sensor_ready_time:
+                sensor_force = read_force_vector(athlete_ft_sensor)
+                plot_force, plot_torque = build_plot_wrench(
+                    athlete_force,
+                    athlete_torque,
+                    sail_force,
+                    sail_torque,
+                )
                 if plotter is not None and simulation_time >= next_plot_time:
-                    plotter.update(simulation_time, athlete_force, athlete_torque)
+                    plotter.update(
+                        simulation_time,
+                        plot_force,
+                        plot_torque,
+                        sensor_force=sensor_force,
+                    )
                     next_plot_time += PLOT_UPDATE_INTERVAL
 
                 saturated = count_saturated_pistons(piston_positions)
@@ -447,10 +553,13 @@ def main():
                 )
 
                 if simulation_time >= next_log_time:
+                    sail_info = (
+                        f"  {sail.status_line()}" if sail is not None and sail.enabled else ""
+                    )
                     print(
                         f"cmd   {format_pose_degrees(command_pose)}  "
                         f"meas  {format_pose_degrees(measured_pose)}  "
-                        f"pistons saturated={saturated}/6"
+                        f"pistons saturated={saturated}/6{sail_info}"
                     )
                     next_log_time += CONSOLE_LOG_INTERVAL
 

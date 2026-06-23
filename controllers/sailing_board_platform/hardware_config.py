@@ -92,6 +92,13 @@ SIM_FULL = {
     "ft_force_deadband": 5.0,
     "ft_torque_deadband": 2.0,
     "ft_filter_hz": 8.0,
+    "sail_area": 6.5,
+    "sail_ce_surge_offset": 0.35,
+    "sail_force_scale": 1.0,
+    "sail_torque_scale": 1.0,
+    "sail_admittance_factor": 0.30,
+    "sail_max_side_force": 180.0,
+    "sail_max_roll_torque": 350.0,
 }
 
 _DESKTOP_SCALE = HARDWARE_SCALE
@@ -135,6 +142,13 @@ DESKTOP_HARDWARE = {
     "ft_force_deadband": 1.5,
     "ft_torque_deadband": 0.08,
     "ft_filter_hz": 10.0,
+    "sail_area": 6.5 * _DESKTOP_SCALE * _DESKTOP_SCALE,
+    "sail_ce_surge_offset": 0.35 * _DESKTOP_SCALE,
+    "sail_force_scale": _DESKTOP_SCALE ** 2,
+    "sail_torque_scale": _DESKTOP_SCALE ** 3,
+    "sail_admittance_factor": 0.30,
+    "sail_max_side_force": 40.0,
+    "sail_max_roll_torque": 60.0,
 }
 
 PRESETS = {

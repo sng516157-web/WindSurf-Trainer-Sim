@@ -2,19 +2,20 @@
 
 **Repository:** [github.com/sng516157-web/WindSurf-Trainer-Sim](https://github.com/sng516157-web/WindSurf-Trainer-Sim)
 
-Land-based **windsurf / sailing-board trainer** simulation built in [Webots R2025a](https://cyberbotics.com/). A six-degree-of-freedom Stewart platform reproduces sea conditions while athlete input—keyboard or **force/torque sensor**—perturbs the deck via admittance control.
+Land-based **windsurf / sailing-board trainer** simulation built in [Webots R2025a](https://cyberbotics.com/). A six-degree-of-freedom Stewart platform reproduces sea conditions while athlete input—keyboard or **force/torque sensor**—and an optional **sail load model** perturb the deck via admittance control.
 
 ## Features
 
 - **6-DOF Stewart platform** with inverse kinematics for six linear pistons
 - **Sea waves** — configurable multi-frequency surge, sway, heave, roll, pitch, yaw (`SEA_STATE`)
 - **Buoyancy model** — spring–damper waterline dynamics (always active); waves toggle independently
+- **Minimal sail model** — wind, sheet trim, gusts; separate admittance path with stability limits (`sail_force.py`)
 - **Keyboard or F/T athlete input** — switchable in the controller (`ATHLETE_INPUT_MODE`)
 - **Hardware presets** — full sim and scaled **desktop** geometry (`hardware_config.py`, `HARDWARE_SCALE = 0.15`)
-- **Admittance control** — athlete wrench perturbs deck pose on top of waves
+- **Admittance control** — athlete + sail wrenches → pose deltas on top of waves
 - **Pose feedback** — deck `GPS` + `InertialUnit` compared to commanded pose (HUD + console)
 - **CSV session logging** — F/T wrench + command/measured pose for sim validation and hardware bring-up
-- **Optional live plots** — matplotlib force/torque charts (`ENABLE_LIVE_PLOTS`)
+- **Live plots** — matplotlib command wrench (solid) + sensor force overlay (dotted); `ENABLE_LIVE_PLOTS`
 
 ## Requirements
 
@@ -39,10 +40,12 @@ Edit the flags at the top of `controllers/sailing_board_platform/sailing_board_p
 
 | Flag | Values | Purpose |
 |------|--------|---------|
-| `PLATFORM_PRESET` | `"sim_full"`, `"desktop_hardware"` | Geometry, sea, admittance tuning |
+| `PLATFORM_PRESET` | `"sim_full"`, `"desktop_hardware"` | Geometry, sea, admittance, sail scaling |
 | `ATHLETE_INPUT_MODE` | `"keyboard"`, `"ft_sensor"` | Keyboard CoG/moments vs F/T wrench |
+| `ENABLE_SAIL` | `True` / `False` | Include sail aerodynamic load model |
 | `ENABLE_CSV_LOGGING` | `True` / `False` | Write `logs/session_*.csv` each run |
-| `ENABLE_LIVE_PLOTS` | `True` / `False` | matplotlib charts (costly in real-time) |
+| `ENABLE_LIVE_PLOTS` | `True` / `False` | matplotlib charts (slower in real-time) |
+| `PLOT_UPDATE_INTERVAL` | e.g. `0.25` | Seconds between plot refreshes |
 
 **F/T mode** reads the Webots `athlete_ft_sensor` (force-3d), estimates torque via `r × F`, calibrates bias at startup, then drives admittance—the same path planned for a physical 6-axis sensor.
 
@@ -51,6 +54,8 @@ CSV logs land in `controllers/sailing_board_platform/logs/` (gitignored).
 ## Keyboard controls
 
 Focus the **3D simulation window** before typing.
+
+### Athlete
 
 | Keys | Action |
 |------|--------|
@@ -62,13 +67,23 @@ Focus the **3D simulation window** before typing.
 | **Z / X** | Apply yaw moment |
 | **P** | Toggle **waves** on/off (buoyancy stays on) |
 
-CoG and applied moments **relax smoothly** to neutral when keys are released.
+### Sail (`ENABLE_SAIL = True`)
+
+| Keys | Action |
+|------|--------|
+| **R / C** | Sheet in / out (more / less power) |
+| **L** | Toggle **sail load** on/off |
+
+CoG and applied moments **relax smoothly** to neutral when keys are released (keyboard input abstraction only—not full sail physics).
+
+**Balancing sail:** Sail side force heels the board to starboard; hike to port (**A**) and roll moment (**←**) to counter. Depower with **C** or disable sail with **L** while tuning.
 
 ## On-screen feedback
 
 The HUD (top-left) shows:
 
-- Wave on/off, buoyancy status, input mode
+- Wave on/off, buoyancy status, sail on/off, input mode
+- Sail line: wind speed, apparent wind angle, sheet, side force, roll torque (when enabled)
 - Athlete CoG (keyboard) or live F/T wrench (sensor mode)
 - **Cmd deck** — commanded 6-DOF pose
 - **Meas deck** — GPS + IMU measured pose
@@ -90,6 +105,7 @@ WindSurf-Trainer-Sim/
         ├── athlete_ft_input.py         # F/T sensor input (hardware + sim)
         ├── hardware_config.py          # sim_full + desktop_hardware presets
         ├── session_logger.py           # CSV F/T + pose logging
+        ├── sail_force.py               # Minimal sail aerodynamic load
         ├── admittance.py
         ├── buoyancy.py
         ├── force_plotter.py
@@ -103,23 +119,39 @@ Presets in `hardware_config.py` bundle geometry, `SEA_STATE`, admittance, buoyan
 | Constant | Purpose |
 |----------|---------|
 | `SEA_STATE` | Wave amplitudes and periods per axis |
-| `TRANSLATION_ADMITTANCE`, `ROTATION_ADMITTANCE` | Wrench → deck motion |
+| `TRANSLATION_ADMITTANCE`, `ROTATION_ADMITTANCE` | Athlete wrench → deck motion |
+| `sail_admittance_factor` | Sail wrench gain (default 0.30 of athlete admittance) |
+| `sail_force_scale`, `sail_torque_scale` | Per-preset sail load scaling |
+| `sail_max_side_force`, `sail_max_roll_torque` | Sail wrench caps |
 | `TRACK_STIFFNESS`, `BUOYANCY_STIFFNESS`, `HYDRO_DAMPING` | Water feel |
 | `ft_force_deadband`, `ft_torque_deadband` | Ignore sensor noise at rest |
 
 **More oscillation:** lower `HYDRO_DAMPING`, slightly raise stiffness.  
-**Stronger athlete effect:** raise admittance gains (watch piston saturation).
+**Stronger athlete effect:** raise admittance gains (watch piston saturation).  
+**Sail too aggressive:** lower `sail_admittance_factor` or press **C** / **L** to depower or disable sail.
+
+Sail stability guards in software: separate sail admittance, per-step pose caps, command roll/pitch clamp (±32°), heel-dependent force fade (no sign flip past 90°).
 
 ## Architecture
 
 ```
 SEA_STATE (waves) ──► equilibrium pose ──┐
                                          ├──► buoyancy ──► command pose ──► IK ──► 6 pistons
-keyboard / F/T ──► wrench ──► admittance ──┘
+keyboard / F/T ──► athlete admittance ───┤
+sail (wind)    ──► sail admittance   ────┘
                               ▲
                     GPS + IMU ├── tracking / HUD / CSV
                     TouchSensor or 6-axis F/T
 ```
+
+## Live plots
+
+Set `ENABLE_LIVE_PLOTS = True` and install matplotlib. Plots show:
+
+- **Solid lines** — combined command force/torque (athlete + sail)
+- **Dotted lines** — TouchSensor force (may read ~0 in Webots due to ball-joint placement)
+
+If the plot window freezes, keep `plt.pause` enabled in `force_plotter.py` (default). Increase `PLOT_UPDATE_INTERVAL` if performance suffers.
 
 ---
 
@@ -264,6 +296,7 @@ Print full geometry from Python: `python -c "from hardware_config import desktop
 - [x] CSV session logging (command vs measured pose + F/T)
 - [x] F/T athlete input module (`athlete_ft_input.py`)
 - [x] Desktop hardware preset (`HARDWARE_SCALE = 0.15`)
+- [x] Minimal sail force module (`sail_force.py`)
 - [ ] Sea presets (calm / moderate / rough)
 - [ ] 3-DOF desktop IK module
 - [ ] Sailing-board mesh and dedicated world
