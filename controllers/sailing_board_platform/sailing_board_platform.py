@@ -15,102 +15,59 @@
 """
 Webots controller for the Stewart platform sailing-board simulator.
 
-Sea motion (SEA_STATE) drives waves on top of buoyancy. Keyboard athlete input
-(CoG shift + applied moments) perturbs the deck; CoG returns smoothly at rest.
-
-Focus the 3D view before using keyboard controls.
+Sea motion (SEA_STATE) drives waves on top of buoyancy. Athlete input (keyboard
+or F/T sensor) perturbs the deck via admittance control.
 
 Deck pose is measured with GPS (deck_gps) and InertialUnit (deck_inertial_unit).
 Both are zeroed to the neutral deck pose at startup.
 """
 
-from controller import Supervisor, TouchSensor
+from controller import Supervisor, TouchSensor, Keyboard
 import math
+import os
 
 from admittance import AdmittanceControl
+from athlete_ft_input import AthleteFTFromForce
 from athlete_input import AthleteKeyboardInput
 from buoyancy import BuoyancyDynamics
 from force_plotter import try_create_plotter
+from hardware_config import load_preset
+from session_logger import SessionLogger
 
-TIME_STEP = 64
-NUM_PISTONS = 6
-PISTON_MIN = -0.4
-PISTON_MAX = 0.4
-NEUTRAL_LEG_LENGTH = 2.8
-ATHLETE_MASS = 70.0
-NEUTRAL_COG_Z = 1.50
-
-# Athlete range — approx. full hiking / trim / pump on a windsurf-style board.
-# Order for limits: surge (x), sway (y), heave (z).
-COG_LIMITS = (0.55, 0.80, 0.30)
-COG_RATE = 0.45
-MOMENT_LIMIT = 700.0
-MOMENT_RATE = 220.0
+# --- Runtime configuration ---------------------------------------------------
+PLATFORM_PRESET = "sim_full"  # "sim_full" | "desktop_hardware"
+ATHLETE_INPUT_MODE = "keyboard"  # "keyboard" | "ft_sensor"
 
 PLOT_HISTORY_SECONDS = 30.0
 ENABLE_LIVE_PLOTS = True
 PLOT_UPDATE_INTERVAL = 0.25
 CONSOLE_LOG_INTERVAL = 1.0
+ENABLE_CSV_LOGGING = True
+CSV_LOG_INTERVAL = 0.05
+CSV_LOG_DIR = "logs"
 
-# Diagonal admittance gains: pose_delta = gain * wrench component.
-# Tuned so full CoG hike + moment keys can reach ~25–35° heel.
-TRANSLATION_ADMITTANCE = (0.0012, 0.0012, 0.0008)
-ROTATION_ADMITTANCE = (0.0010, 0.0010, 0.0005)
-
-# Buoyancy: track_stiffness follows target, buoyancy_stiffness restores to waterline.
-# Order: surge, sway, heave, roll, pitch, yaw.
-TRACK_STIFFNESS = (10.0, 10.0, 14.0, 9.0, 9.0, 6.0)
-BUOYANCY_STIFFNESS = (5.0, 5.0, 9.0, 6.0, 6.0, 4.0)
-HYDRO_DAMPING = (1.8, 1.8, 2.5, 0.9, 0.9, 0.7)
-
-# Geometry extracted from stewart_platform.wbt at the neutral configuration.
-BASE_ANCHORS = [
-    [-1.20951, 1.57453, 0.120577],
-    [-1.20951, -1.57453, 0.120577],
-    [-0.75883, -1.83473, 0.120577],
-    [1.96834, -0.260201, 0.120577],
-    [1.96834, 0.260201, 0.120577],
-    [-0.75883, 1.83473, 0.120577],
-]
-
-PLATFORM_NEUTRAL_TRANSLATION = [0.514172, 0.235049, 0.917719]
-PLATFORM_NEUTRAL_ROTATION = (
-    [0.7176690794221499, -0.12654500989810902, 0.6847900794486234],
-    2.65306,
-)
-
-PLATFORM_LOCAL_ANCHORS = [
-    [1.4685, 1.0452, -1.2626],
-    [1.4097, 1.3792, -1.0668],
-    [1.4097, 1.3792, 0.4113],
-    [1.4686, 1.0452, 0.6071],
-    [1.6908, -0.2154, -0.1320],
-    [1.6908, -0.2154, -0.5236],
-]
-
-SEA_STATE = {
-    "heave": [
-        (0.08, 6.0, 0.0),
-        (0.04, 3.5, 1.2),
-    ],
-    "surge": [
-        (0.03, 7.0, 0.5),
-    ],
-    "sway": [
-        (0.025, 5.5, 2.0),
-    ],
-    "roll": [
-        (0.10, 5.0, 0.0),
-        (0.04, 2.8, 0.8),
-    ],
-    "pitch": [
-        (0.07, 4.5, 1.5),
-        (0.03, 8.0, 0.0),
-    ],
-    "yaw": [
-        (0.02, 9.0, 0.0),
-    ],
-}
+CFG = load_preset(PLATFORM_PRESET)
+TIME_STEP = CFG["time_step"]
+NUM_PISTONS = CFG["num_pistons"]
+PISTON_MIN = CFG["piston_min"]
+PISTON_MAX = CFG["piston_max"]
+NEUTRAL_LEG_LENGTH = CFG["neutral_leg_length"]
+ATHLETE_MASS = CFG["athlete_mass"]
+NEUTRAL_COG_Z = CFG["neutral_cog_z"]
+COG_LIMITS = CFG["cog_limits"]
+COG_RATE = CFG["cog_rate"]
+MOMENT_LIMIT = CFG["moment_limit"]
+MOMENT_RATE = CFG["moment_rate"]
+TRANSLATION_ADMITTANCE = CFG["translation_admittance"]
+ROTATION_ADMITTANCE = CFG["rotation_admittance"]
+TRACK_STIFFNESS = CFG["track_stiffness"]
+BUOYANCY_STIFFNESS = CFG["buoyancy_stiffness"]
+HYDRO_DAMPING = CFG["hydro_damping"]
+BASE_ANCHORS = CFG["base_anchors"]
+PLATFORM_NEUTRAL_TRANSLATION = CFG["platform_neutral_translation"]
+PLATFORM_NEUTRAL_ROTATION = CFG["platform_neutral_rotation"]
+PLATFORM_LOCAL_ANCHORS = CFG["platform_local_anchors"]
+SEA_STATE = CFG["sea_state"]
 
 
 def axis_angle_to_matrix(axis, angle):
@@ -157,10 +114,6 @@ def cross(left, right):
         left[2] * right[0] - left[0] * right[2],
         left[0] * right[1] - left[1] * right[0],
     ]
-
-
-def estimate_torque(force, lever_arm):
-    return cross(lever_arm, force)
 
 
 def athlete_lever_arm(cog_offset, neutral_cog_z):
@@ -210,6 +163,12 @@ def read_orientation_delta(inertial_unit, neutral_rpy):
     )
 
 
+def athlete_input_label(athlete):
+    if hasattr(athlete, "input_label"):
+        return athlete.input_label
+    return "keyboard"
+
+
 def update_hud(
     supervisor,
     waves_enabled,
@@ -222,11 +181,22 @@ def update_hud(
         return
     wave_state = "WAVES ON" if waves_enabled else "WAVES OFF"
     lines = [
-        f"{wave_state}  |  buoyancy on",
-        f"CoG [{athlete.cog_offset[0]:+.2f}, {athlete.cog_offset[1]:+.2f}, "
-        f"{athlete.cog_offset[2]:+.2f}] m",
-        f"Cmd deck: {format_pose_degrees(command_pose)}",
+        f"{wave_state}  |  buoyancy on  |  {athlete_input_label(athlete)}",
     ]
+
+    if ATHLETE_INPUT_MODE == "keyboard":
+        lines.append(
+            f"CoG [{athlete.cog_offset[0]:+.2f}, {athlete.cog_offset[1]:+.2f}, "
+            f"{athlete.cog_offset[2]:+.2f}] m"
+        )
+    else:
+        force, torque = athlete.wrench()
+        lines.append(
+            f"F/T [{force[0]:+.1f}, {force[1]:+.1f}, {force[2]:+.1f}] N  "
+            f"τ [{torque[0]:+.1f}, {torque[1]:+.1f}, {torque[2]:+.1f}] N·m"
+        )
+
+    lines.append(f"Cmd deck: {format_pose_degrees(command_pose)}")
     if measured_pose is not None:
         lines.append(f"Meas deck: {format_pose_degrees(measured_pose)}")
         surge_err = (measured_pose[0] - command_pose[0]) * 1000.0
@@ -341,23 +311,18 @@ def count_saturated_pistons(piston_positions):
     )
 
 
-def main():
-    robot = Supervisor()
-    time_step = int(robot.getBasicTimeStep())
-    if time_step <= 0:
-        time_step = TIME_STEP
-    dt = time_step / 1000.0
+def create_athlete_input(robot, athlete_ft_sensor):
+    if ATHLETE_INPUT_MODE == "ft_sensor":
+        lever_arm = [0.0, 0.0, NEUTRAL_COG_Z]
+        return AthleteFTFromForce(
+            force_reader=lambda: read_force_vector(athlete_ft_sensor),
+            lever_arm=lever_arm,
+            force_deadband=CFG["ft_force_deadband"],
+            torque_deadband=CFG["ft_torque_deadband"],
+            filter_hz=CFG["ft_filter_hz"],
+        )
 
-    robot.getKeyboard().enable(time_step)
-    pistons = find_pistons(robot)
-    athlete_ft = find_athlete_force_sensor(robot, time_step)
-    deck_imu = find_deck_inertial_unit(robot, time_step)
-    deck_gps = find_deck_gps(robot, time_step)
-    kinematics = StewartInverseKinematics()
-    sea = SeaWaveMotion(SEA_STATE)
-    admittance = AdmittanceControl(TRANSLATION_ADMITTANCE, ROTATION_ADMITTANCE)
-    buoyancy = BuoyancyDynamics(TRACK_STIFFNESS, BUOYANCY_STIFFNESS, HYDRO_DAMPING)
-    athlete = AthleteKeyboardInput(
+    return AthleteKeyboardInput(
         robot.getKeyboard(),
         mass=ATHLETE_MASS,
         neutral_cog_z=NEUTRAL_COG_Z,
@@ -366,14 +331,46 @@ def main():
         moment_rate=MOMENT_RATE,
         moment_limit=MOMENT_LIMIT,
     )
+
+
+def main():
+    robot = Supervisor()
+    time_step = int(robot.getBasicTimeStep())
+    if time_step <= 0:
+        time_step = TIME_STEP
+    dt = time_step / 1000.0
+
+    keyboard = robot.getKeyboard()
+    keyboard.enable(time_step)
+    pistons = find_pistons(robot)
+    athlete_ft_sensor = find_athlete_force_sensor(robot, time_step)
+    deck_imu = find_deck_inertial_unit(robot, time_step)
+    deck_gps = find_deck_gps(robot, time_step)
+    kinematics = StewartInverseKinematics()
+    sea = SeaWaveMotion(SEA_STATE)
+    admittance = AdmittanceControl(TRANSLATION_ADMITTANCE, ROTATION_ADMITTANCE)
+    buoyancy = BuoyancyDynamics(TRACK_STIFFNESS, BUOYANCY_STIFFNESS, HYDRO_DAMPING)
+    athlete = create_athlete_input(robot, athlete_ft_sensor)
     plotter = try_create_plotter(
         history_seconds=PLOT_HISTORY_SECONDS,
         enabled=ENABLE_LIVE_PLOTS,
     )
+    log_dir = os.path.join(os.path.dirname(__file__), CSV_LOG_DIR)
+    session_logger = SessionLogger(
+        log_dir=log_dir,
+        enabled=ENABLE_CSV_LOGGING,
+        interval_s=CSV_LOG_INTERVAL,
+        prefix=f"{PLATFORM_PRESET}_{ATHLETE_INPUT_MODE}",
+    )
 
-    AthleteKeyboardInput.print_controls()
+    print(f"Platform preset: {PLATFORM_PRESET} ({CFG['description']})")
+    print(f"Athlete input: {ATHLETE_INPUT_MODE}")
+    if session_logger.path:
+        print(f"CSV logging: {session_logger.path}")
+
+    athlete.print_controls()
     if not ENABLE_LIVE_PLOTS:
-        print("Performance tip: live plots are off by default (matplotlib slows Webots).")
+        print("Performance tip: live plots are off (matplotlib slows Webots).")
 
     waves_enabled = True
     deck_neutral_xyz = None
@@ -382,14 +379,29 @@ def main():
     sensor_ready_time = dt
     next_plot_time = sensor_ready_time
     next_log_time = sensor_ready_time
+    previous_keys = set()
     try:
         while robot.step(time_step) != -1:
-            newly_pressed = athlete.update(dt)
+            newly_pressed = set()
+            if ATHLETE_INPUT_MODE == "keyboard":
+                newly_pressed = athlete.update(dt)
+            else:
+                athlete.update(dt)
+                keys_now = set()
+                for _ in range(7):
+                    key = keyboard.getKey()
+                    if key == -1:
+                        break
+                    keys_now.add(key & Keyboard.KEY)
+                newly_pressed = keys_now - previous_keys
+                previous_keys = keys_now
+
             if ord("p") in newly_pressed or ord("P") in newly_pressed:
                 waves_enabled = not waves_enabled
                 print(f"Waves {'enabled' if waves_enabled else 'disabled'} (buoyancy still active).")
 
-            athlete.update_visual(robot)
+            if ATHLETE_INPUT_MODE == "keyboard":
+                athlete.update_visual(robot)
 
             athlete_force, athlete_torque = athlete.wrench()
             wave_pose = sea.pose_at(simulation_time) if waves_enabled else (0.0,) * 6
@@ -418,16 +430,23 @@ def main():
             )
 
             if simulation_time >= sensor_ready_time:
-                lever_arm = athlete_lever_arm(athlete.cog_offset, NEUTRAL_COG_Z)
-                measured_force = read_force_vector(athlete_ft)
-                measured_torque = estimate_torque(measured_force, lever_arm)
-
                 if plotter is not None and simulation_time >= next_plot_time:
-                    plotter.update(simulation_time, measured_force, measured_torque)
+                    plotter.update(simulation_time, athlete_force, athlete_torque)
                     next_plot_time += PLOT_UPDATE_INTERVAL
 
+                saturated = count_saturated_pistons(piston_positions)
+                session_logger.maybe_log(
+                    simulation_time,
+                    waves_enabled,
+                    ATHLETE_INPUT_MODE,
+                    athlete_force,
+                    athlete_torque,
+                    command_pose,
+                    measured_pose,
+                    saturated,
+                )
+
                 if simulation_time >= next_log_time:
-                    saturated = count_saturated_pistons(piston_positions)
                     print(
                         f"cmd   {format_pose_degrees(command_pose)}  "
                         f"meas  {format_pose_degrees(measured_pose)}  "
@@ -437,6 +456,7 @@ def main():
 
             simulation_time += dt
     finally:
+        session_logger.close()
         if plotter is not None:
             plotter.close()
 
